@@ -104,11 +104,27 @@ require_root() {
   [[ "${EUID}" -eq 0 ]] || die "run this script as root"
 }
 
+read_os_release_field() {
+  local key="$1"
+  local value
+
+  value="$(awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' /etc/os-release)"
+
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+
+  printf '%s\n' "${value}"
+}
+
 require_debian() {
+  local os_id
+  local os_id_like
+
   [[ -r /etc/os-release ]] || die "cannot detect operating system"
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] || die "this script is intended for Debian-based systems"
+  os_id="$(read_os_release_field ID)"
+  os_id_like="$(read_os_release_field ID_LIKE)"
+  [[ "${os_id}" == "debian" || "${os_id_like}" == *debian* ]] || die "this script is intended for Debian-based systems"
 }
 
 validate_port() {
