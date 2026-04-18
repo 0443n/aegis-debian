@@ -237,7 +237,7 @@ allow_ufw_port_if_needed() {
 configure_ssh_port() {
   local sshd_config="/etc/ssh/sshd_config"
   local backup
-  local temp_file
+  local temp_file=""
 
   [[ -f "${sshd_config}" ]] || die "missing ${sshd_config}"
   command -v sshd >/dev/null 2>&1 || die "openssh-server is not installed"
@@ -248,7 +248,6 @@ configure_ssh_port() {
   fi
 
   temp_file="$(mktemp)"
-  trap 'rm -f "${temp_file}"' RETURN
   render_sshd_config "${sshd_config}" > "${temp_file}"
 
   log "validating sshd configuration"
@@ -257,12 +256,14 @@ configure_ssh_port() {
   if (( DRY_RUN )); then
     log "dry-run: backup ${sshd_config} -> ${backup}"
     log "dry-run: install new sshd config at ${sshd_config}"
+    rm -f -- "${temp_file}"
   else
     cp "${sshd_config}" "${backup}"
     log "backup created at ${backup}"
     chmod --reference="${sshd_config}" "${temp_file}"
     chown --reference="${sshd_config}" "${temp_file}"
     mv "${temp_file}" "${sshd_config}"
+    temp_file=""
   fi
 
   allow_ufw_port_if_needed
