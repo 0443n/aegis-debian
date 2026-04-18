@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 
 # Override these with environment variables when needed, for example:
-# SSH_PORT=54322 JOURNAL_SYSTEM_MAX_USE=300M ./setup-debian.sh
+# SSH_PORT=54322 JOURNAL_SYSTEM_MAX_USE=300M ./setup-debian.sh --dry-run
+DRY_RUN=0
 SSH_PORT="${SSH_PORT:-4386}"
 JOURNAL_SYSTEM_MAX_USE="${JOURNAL_SYSTEM_MAX_USE:-200M}"
 JOURNAL_RUNTIME_MAX_USE="${JOURNAL_RUNTIME_MAX_USE:-50M}"
@@ -11,6 +12,12 @@ JOURNAL_VACUUM_SIZE="${JOURNAL_VACUUM_SIZE:-200M}"
 PACKAGES=(
   fastfetch
   ncdu
+)
+STEPS=(
+  refresh_system
+  install_packages
+  configure_ssh_port
+  configure_journald
 )
 
 log() {
@@ -20,6 +27,57 @@ log() {
 die() {
   printf '[setup] error: %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./setup-debian.sh [--dry-run]
+
+Options:
+  -n, --dry-run  Show what would run without changing the system
+  -h, --help     Show this help
+EOF
+}
+
+run() {
+  if (( DRY_RUN )); then
+    printf '[setup] dry-run:'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+
+  "$@"
+}
+
+write_file() {
+  local target="$1"
+
+  if (( DRY_RUN )); then
+    log "dry-run: write ${target}"
+    cat >/dev/null
+    return 0
+  fi
+
+  cat > "${target}"
+}
+
+parse_args() {
+  while (($# > 0)); do
+    case "$1" in
+      -n|--dry-run)
+        DRY_RUN=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
 }
 
 require_root() {
@@ -42,43 +100,9 @@ port_is_listening() {
   ss -ltnH "sport = :${SSH_PORT}" 2>/dev/null | grep -q .
 }
 
-install_packages() {
-  log "updating apt metadata"
-  apt-get update
+render_sshd_config() {
+  local source_file="$1"
 
-  log "installing packages: ${PACKAGES[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
-}
-
-allow_ufw_port_if_needed() {
-  if ! command -v ufw >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if ! ufw status 2>/dev/null | grep -q '^Status: active$'; then
-    return 0
-  fi
-
-  log "allowing TCP ${SSH_PORT} in ufw"
-  ufw allow "${SSH_PORT}/tcp"
-}
-
-configure_ssh_port() {
-  local sshd_config="/etc/ssh/sshd_config"
-  local backup="${sshd_config}.bak.$(date +%Y%m%d%H%M%S)"
-  local temp_file
-
-  [[ -f "${sshd_config}" ]] || die "missing ${sshd_config}"
-  command -v sshd >/dev/null 2>&1 || die "openssh-server is not installed"
-
-  if port_is_listening && ! grep -Eq "^[[:space:]]*Port[[:space:]]+${SSH_PORT}[[:space:]]*$" "${sshd_config}"; then
-    die "TCP port ${SSH_PORT} is already in use"
-  fi
-
-  cp "${sshd_config}" "${backup}"
-  log "backup created at ${backup}"
-
-  temp_file="$(mktemp)"
   awk -v port="${SSH_PORT}" '
     BEGIN {
       replaced = 0
@@ -99,46 +123,109 @@ configure_ssh_port() {
         print "Port " port
       }
     }
-  ' "${sshd_config}" > "${temp_file}"
-  mv "${temp_file}" "${sshd_config}"
+  ' "${source_file}"
+}
+
+refresh_system() {
+  log "updating apt metadata"
+  run apt-get update
+
+  log "upgrading installed packages"
+  run env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+}
+
+install_packages() {
+  log "installing packages: ${PACKAGES[*]}"
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
+}
+
+allow_ufw_port_if_needed() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! ufw status 2>/dev/null | grep -q '^Status: active$'; then
+    return 0
+  fi
+
+  log "allowing TCP ${SSH_PORT} in ufw"
+  run ufw allow "${SSH_PORT}/tcp"
+}
+
+configure_ssh_port() {
+  local sshd_config="/etc/ssh/sshd_config"
+  local backup="${sshd_config}.bak.$(date +%Y%m%d%H%M%S)"
+  local temp_file
+
+  [[ -f "${sshd_config}" ]] || die "missing ${sshd_config}"
+  command -v sshd >/dev/null 2>&1 || die "openssh-server is not installed"
+
+  if port_is_listening && ! grep -Eq "^[[:space:]]*Port[[:space:]]+${SSH_PORT}[[:space:]]*$" "${sshd_config}"; then
+    die "TCP port ${SSH_PORT} is already in use"
+  fi
+
+  temp_file="$(mktemp)"
+  trap 'rm -f "${temp_file}"' RETURN
+  render_sshd_config "${sshd_config}" > "${temp_file}"
 
   log "validating sshd configuration"
-  sshd -t
+  sshd -t -f "${temp_file}"
+
+  if (( DRY_RUN )); then
+    log "dry-run: backup ${sshd_config} -> ${backup}"
+    log "dry-run: install new sshd config at ${sshd_config}"
+  else
+    cp "${sshd_config}" "${backup}"
+    log "backup created at ${backup}"
+    chmod --reference="${sshd_config}" "${temp_file}"
+    chown --reference="${sshd_config}" "${temp_file}"
+    mv "${temp_file}" "${sshd_config}"
+  fi
 
   allow_ufw_port_if_needed
 
   log "restarting ssh service"
-  systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
+  if (( DRY_RUN )); then
+    log "dry-run: systemctl restart ssh.service || systemctl restart sshd.service"
+  else
+    systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service
+  fi
 }
 
 configure_journald() {
   local dropin_dir="/etc/systemd/journald.conf.d"
   local dropin_file="${dropin_dir}/99-storage-limits.conf"
 
-  mkdir -p "${dropin_dir}"
-
-  cat > "${dropin_file}" <<EOF
+  run mkdir -p "${dropin_dir}"
+  write_file "${dropin_file}" <<EOF
 [Journal]
 SystemMaxUse=${JOURNAL_SYSTEM_MAX_USE}
 RuntimeMaxUse=${JOURNAL_RUNTIME_MAX_USE}
 EOF
 
   log "restarting systemd-journald"
-  systemctl restart systemd-journald
+  run systemctl restart systemd-journald
 
   log "rotating and vacuuming journal logs"
-  journalctl --rotate
-  journalctl --vacuum-size="${JOURNAL_VACUUM_SIZE}"
+  run journalctl --rotate
+  run journalctl --vacuum-size="${JOURNAL_VACUUM_SIZE}"
+}
+
+run_steps() {
+  local step
+
+  for step in "${STEPS[@]}"; do
+    log "step: ${step}"
+    "${step}"
+  done
 }
 
 main() {
+  parse_args "$@"
   require_root
   require_debian
   validate_port
-
-  install_packages
-  configure_ssh_port
-  configure_journald
+  run_steps
 
   log "done"
   log "ssh now listens on TCP ${SSH_PORT}"
